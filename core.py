@@ -96,22 +96,26 @@ def init_db(db_path=None):
             is_active INTEGER DEFAULT 1
         )
     """)
+    cur.execute("CREATE TABLE IF NOT EXISTS models (name TEXT PRIMARY KEY)")
+    cur.execute("CREATE TABLE IF NOT EXISTS warehouses (name TEXT PRIMARY KEY)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_serial_norm ON serial_numbers(serial_number_norm)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_invoice_number ON serial_numbers(invoice_number)")
     conn.commit()
 
     # --- migration for databases created by an earlier version of this app ---
     existing_cols = _table_columns(conn, "serial_numbers")
-    for col in ("vehicle_number", "customer_name", "entry_date", "storage_location"):
+    for col in ("vehicle_number", "customer_name", "entry_date", "storage_location", "warehouse"):
         if col not in existing_cols:
             cur.execute(f"ALTER TABLE serial_numbers ADD COLUMN {col} TEXT")
     dup_cols = _table_columns(conn, "duplicates_review")
-    for col in ("vehicle_number", "customer_name", "entry_date", "storage_location"):
+    for col in ("vehicle_number", "customer_name", "entry_date", "storage_location", "warehouse"):
         if col not in dup_cols:
             cur.execute(f"ALTER TABLE duplicates_review ADD COLUMN {col} TEXT")
     inv_cols = _table_columns(conn, "invoices")
     if "storage_location" not in inv_cols:
         cur.execute("ALTER TABLE invoices ADD COLUMN storage_location TEXT")
+    if "warehouse" not in inv_cols:
+        cur.execute("ALTER TABLE invoices ADD COLUMN warehouse TEXT")
     conn.commit()
 
     # --- seed the default admin account the very first time the DB is created ---
@@ -219,6 +223,94 @@ def list_users(conn):
     return cur.fetchall()
 
 
+# --- Model / Warehouse lookup lists (for dropdowns) ---
+
+def list_models(conn):
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM models ORDER BY name")
+    return [r[0] for r in cur.fetchall()]
+
+
+def add_model(conn, name):
+    name = (name or "").strip()
+    if not name:
+        return
+    cur = conn.cursor()
+    cur.execute("INSERT OR IGNORE INTO models (name) VALUES (?)", (name,))
+    conn.commit()
+
+
+def list_warehouses(conn):
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM warehouses ORDER BY name")
+    return [r[0] for r in cur.fetchall()]
+
+
+def add_warehouse(conn, name):
+    name = (name or "").strip()
+    if not name:
+        return
+    cur = conn.cursor()
+    cur.execute("INSERT OR IGNORE INTO warehouses (name) VALUES (?)", (name,))
+    conn.commit()
+
+
+def import_lookup_lists(conn, filepath):
+    """
+    Reads an Excel file for Model / Warehouse lists. Accepts either:
+      - a single sheet with 'Model' and 'Warehouse' columns (any order), or
+      - separate sheets named 'Models' and 'Warehouses' each with one column of names.
+    Blank cells are ignored. Returns counts added.
+    """
+    wb = openpyxl.load_workbook(filepath, data_only=True, read_only=True)
+    added_models, added_warehouses = 0, 0
+
+    def norm_header(v):
+        return (str(v).strip().lower() if v is not None else "")
+
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        rows_iter = ws.iter_rows(values_only=True)
+        try:
+            header_row = list(next(rows_iter))
+        except StopIteration:
+            continue
+        headers = [norm_header(h) for h in header_row]
+
+        model_idx = next((i for i, h in enumerate(headers) if "model" in h), None)
+        warehouse_idx = next((i for i, h in enumerate(headers) if "warehouse" in h), None)
+
+        sheet_lower = sheet_name.strip().lower()
+        if model_idx is None and warehouse_idx is None:
+            # whole sheet is a single flat list - use the sheet name to decide which list
+            if "warehouse" in sheet_lower:
+                warehouse_idx = 0
+            else:
+                model_idx = 0
+            # first row wasn't necessarily a header in this case - treat it as data too
+            if header_row and header_row[0] not in (None, ""):
+                val = str(header_row[0]).strip()
+                if warehouse_idx == 0:
+                    add_warehouse(conn, val)
+                    added_warehouses += 1
+                else:
+                    add_model(conn, val)
+                    added_models += 1
+
+        for row in rows_iter:
+            if row is None:
+                continue
+            if model_idx is not None and model_idx < len(row) and row[model_idx]:
+                add_model(conn, str(row[model_idx]).strip())
+                added_models += 1
+            if warehouse_idx is not None and warehouse_idx < len(row) and row[warehouse_idx]:
+                add_warehouse(conn, str(row[warehouse_idx]).strip())
+                added_warehouses += 1
+
+    wb.close()
+    return {"models_added": added_models, "warehouses_added": added_warehouses}
+
+
 def find_existing(conn, serial_number):
     norm = _normalize(serial_number)
     cur = conn.cursor()
@@ -234,19 +326,19 @@ def get_invoice(conn, invoice_number):
         return None
     cur = conn.cursor()
     cur.execute("SELECT invoice_number, quantity, model, vehicle_number, customer_name, entry_date, "
-                "storage_location FROM invoices WHERE invoice_number = ?", (invoice_number.strip(),))
+                "storage_location, warehouse FROM invoices WHERE invoice_number = ?", (invoice_number.strip(),))
     row = cur.fetchone()
     if not row:
         return None
     return {
         "invoice_number": row[0], "quantity": row[1], "model": row[2],
         "vehicle_number": row[3], "customer_name": row[4], "entry_date": row[5],
-        "storage_location": row[6],
+        "storage_location": row[6], "warehouse": row[7],
     }
 
 
 def upsert_invoice(conn, invoice_number, quantity=None, model="", vehicle_number="",
-                    customer_name="", entry_date="", storage_location=""):
+                    customer_name="", entry_date="", storage_location="", warehouse=""):
     invoice_number = (invoice_number or "").strip()
     if not invoice_number:
         raise ValueError("Invoice number is required")
@@ -254,13 +346,15 @@ def upsert_invoice(conn, invoice_number, quantity=None, model="", vehicle_number
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO invoices (invoice_number, quantity, model, vehicle_number, customer_name, entry_date,
-                               storage_location, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                               storage_location, warehouse, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(invoice_number) DO UPDATE SET
             quantity=excluded.quantity, model=excluded.model, vehicle_number=excluded.vehicle_number,
             customer_name=excluded.customer_name, entry_date=excluded.entry_date,
-            storage_location=excluded.storage_location, updated_at=excluded.updated_at
-    """, (invoice_number, quantity, model, vehicle_number, customer_name, entry_date, storage_location, now))
+            storage_location=excluded.storage_location, warehouse=excluded.warehouse,
+            updated_at=excluded.updated_at
+    """, (invoice_number, quantity, model, vehicle_number, customer_name, entry_date, storage_location,
+          warehouse, now))
     conn.commit()
 
 
@@ -277,12 +371,13 @@ def count_for_invoice(conn, invoice_number):
 
 def add_record(conn, serial_number, model="", invoice_number="", sheet_name="", source="manual",
                 added_by="", vehicle_number="", customer_name="", entry_date="", storage_location="",
-                enforce_invoice_quantity=True):
+                warehouse="", enforce_invoice_quantity=True):
     """
     Adds a record.
     Returns one of:
       ('added', new_id)
-      ('flagged_duplicate', existing_id)
+      ('flagged_duplicate', {'dup_id':.., 'existing_id':.., 'existing_model':.., 'existing_invoice':..,
+                              'existing_sheet':.., 'existing_date_added':..})
       ('skipped_empty', None)
       ('exceeds_quantity', {'invoice_number':.., 'quantity':.., 'used':..})
     """
@@ -309,20 +404,23 @@ def add_record(conn, serial_number, model="", invoice_number="", sheet_name="", 
         cur.execute("""
             INSERT INTO duplicates_review
             (serial_number, model, invoice_number, vehicle_number, customer_name, entry_date,
-             storage_location, sheet_name, date_added, source, added_by, existing_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             storage_location, warehouse, sheet_name, date_added, source, added_by, existing_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (serial_number, model, invoice_number, vehicle_number, customer_name, entry_date,
-              storage_location, sheet_name, now, source, added_by, existing[0]))
+              storage_location, warehouse, sheet_name, now, source, added_by, existing[0]))
         conn.commit()
-        return ("flagged_duplicate", existing[0])
+        return ("flagged_duplicate", {
+            "dup_id": cur.lastrowid, "existing_id": existing[0], "existing_model": existing[2],
+            "existing_invoice": existing[3], "existing_sheet": existing[4], "existing_date_added": existing[5],
+        })
 
     cur.execute("""
         INSERT INTO serial_numbers
         (serial_number, serial_number_norm, model, invoice_number, vehicle_number, customer_name,
-         entry_date, storage_location, sheet_name, date_added, source, added_by)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         entry_date, storage_location, warehouse, sheet_name, date_added, source, added_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (serial_number, _normalize(serial_number), model, invoice_number, vehicle_number, customer_name,
-          entry_date, storage_location, sheet_name, now, source, added_by))
+          entry_date, storage_location, warehouse, sheet_name, now, source, added_by))
     conn.commit()
     return ("added", cur.lastrowid)
 
@@ -335,7 +433,8 @@ HEADER_ALIASES = {
     "invoice_number": ["invoice number", "invoice no", "invoice", "inv no"],
     "vehicle_number": ["vehicle number", "vehicle no", "truck number", "truck no"],
     "customer_name": ["customer name", "customer", "consignee", "consignee name"],
-    "storage_location": ["storage location", "storage loc", "location", "warehouse location", "rack location", "rack"],
+    "storage_location": ["storage location", "storage loc", "location", "rack location", "rack"],
+    "warehouse": ["warehouse", "warehouse name", "wh"],
 }
 
 
@@ -387,6 +486,7 @@ def import_excel_file(conn, filepath, source_label=None, added_by="", enforce_in
         v_idx = col_map.get("vehicle_number")
         c_idx = col_map.get("customer_name")
         l_idx = col_map.get("storage_location")
+        w_idx = col_map.get("warehouse")
 
         def cell(row, idx):
             if idx is None or idx >= len(row) or row[idx] is None:
@@ -409,6 +509,7 @@ def import_excel_file(conn, filepath, source_label=None, added_by="", enforce_in
                 vehicle_number=cell(row, v_idx),
                 customer_name=cell(row, c_idx),
                 storage_location=cell(row, l_idx),
+                warehouse=cell(row, w_idx),
                 sheet_name=f"{file_label} / {sheet_name}",
                 source="upload",
                 added_by=added_by,
@@ -442,30 +543,30 @@ def get_pending_duplicates(conn):
 def resolve_duplicate(conn, dup_id, action):
     cur = conn.cursor()
     cur.execute("""SELECT serial_number, model, invoice_number, vehicle_number, customer_name, entry_date,
-                    storage_location, sheet_name, date_added, source, added_by, existing_id
+                    storage_location, warehouse, sheet_name, date_added, source, added_by, existing_id
                     FROM duplicates_review WHERE id = ?""", (dup_id,))
     row = cur.fetchone()
     if not row:
         return False
     (serial_number, model, invoice_number, vehicle_number, customer_name, entry_date,
-     storage_location, sheet_name, date_added, source, added_by, existing_id) = row
+     storage_location, warehouse, sheet_name, date_added, source, added_by, existing_id) = row
 
     if action == "replace" and existing_id:
         cur.execute("""
             UPDATE serial_numbers
             SET serial_number = ?, model = ?, invoice_number = ?, vehicle_number = ?, customer_name = ?,
-                entry_date = ?, storage_location = ?, sheet_name = ?, date_added = ?
+                entry_date = ?, storage_location = ?, warehouse = ?, sheet_name = ?, date_added = ?
             WHERE id = ?
         """, (serial_number, model, invoice_number, vehicle_number, customer_name, entry_date,
-              storage_location, sheet_name, date_added, existing_id))
+              storage_location, warehouse, sheet_name, date_added, existing_id))
     elif action == "keep_both":
         cur.execute("""
             INSERT INTO serial_numbers
             (serial_number, serial_number_norm, model, invoice_number, vehicle_number, customer_name,
-             entry_date, storage_location, sheet_name, date_added, source, added_by)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             entry_date, storage_location, warehouse, sheet_name, date_added, source, added_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (serial_number, _normalize(serial_number), model, invoice_number, vehicle_number, customer_name,
-              entry_date, storage_location, sheet_name, date_added, source, added_by))
+              entry_date, storage_location, warehouse, sheet_name, date_added, source, added_by))
 
     cur.execute("UPDATE duplicates_review SET resolved = 1 WHERE id = ?", (dup_id,))
     conn.commit()
@@ -499,7 +600,7 @@ def search_master(conn, query="", date_from="", date_to="", limit=500):
 
     sql = f"""
         SELECT id, serial_number, model, invoice_number, vehicle_number, customer_name,
-               storage_location, {effective_date} as eff_date, sheet_name, date_added
+               storage_location, warehouse, {effective_date} as eff_date, sheet_name, date_added
         FROM serial_numbers
         WHERE {' AND '.join(where)}
         ORDER BY id DESC LIMIT ?
@@ -536,7 +637,7 @@ def export_master(conn, out_path, query="", date_from="", date_to=""):
     ws.title = "Master_Consolidated"
 
     headers = ["Sl No", "Serial Number", "Model", "Invoice Number", "Vehicle Number",
-               "Customer Name", "Storage Location", "Date", "Sheet Name", "Date Added"]
+               "Customer Name", "Storage Location", "Warehouse", "Date", "Sheet Name", "Scan Time"]
     ws.append(headers)
     header_font = Font(name="Arial", bold=True, color="FFFFFF")
     header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
@@ -549,12 +650,13 @@ def export_master(conn, out_path, query="", date_from="", date_to=""):
     rows = search_master(conn, query=query, date_from=date_from, date_to=date_to, limit=1000000)
     rows = list(reversed(rows))  # oldest first in export
     for i, r in enumerate(rows, start=1):
-        _id, serial, model, invoice, vehicle, customer, storage_location, eff_date, sheet, date_added = r
-        ws.append([i, serial, model, invoice, vehicle, customer, storage_location, eff_date, sheet, date_added])
+        _id, serial, model, invoice, vehicle, customer, storage_location, warehouse, eff_date, sheet, date_added = r
+        ws.append([i, serial, model, invoice, vehicle, customer, storage_location, warehouse, eff_date, sheet,
+                   date_added])
         for col in range(1, len(headers) + 1):
             ws.cell(row=i + 1, column=col).font = Font(name="Arial")
 
-    widths = [8, 22, 16, 18, 16, 20, 18, 14, 28, 20]
+    widths = [8, 22, 16, 18, 16, 20, 18, 16, 14, 28, 20]
     for i, w in enumerate(widths, start=1):
         ws.column_dimensions[chr(64 + i)].width = w
 
