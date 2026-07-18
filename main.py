@@ -350,6 +350,20 @@ def health():
     return {"status": "ok", "app": "Serial Number Consolidator API"}
 
 
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
+
+@app.get("/download")
+def download_client():
+    """Lets the team download the client app straight from the server URL,
+    e.g. https://your-app.onrender.com/download - no need to hand out the
+    zip file PC by PC. No login required (it's just the installer)."""
+    path = os.path.join(STATIC_DIR, "SerialConsolidator_Client.zip")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Client package not bundled with this server deploy.")
+    return FileResponse(path, filename="SerialConsolidator_Client.zip", media_type="application/zip")
+
+
 # --- Model / Warehouse lookup lists ---
 
 @app.get("/models")
