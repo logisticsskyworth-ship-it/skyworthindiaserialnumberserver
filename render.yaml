@@ -8,6 +8,8 @@ services:
     envVars:
       - key: DATA_DIR
         value: /data
+      - key: PYTHON_VERSION
+        value: 3.11.9
     disk:
       name: serial-data
       mountPath: /data
