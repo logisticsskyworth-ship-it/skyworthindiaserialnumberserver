@@ -103,6 +103,7 @@ class InvoiceBody(BaseModel):
     customer_name: str = ""
     entry_date: str = ""
     storage_location: str = ""
+    warehouse: str = ""
 
 
 @app.post("/invoices")
@@ -112,7 +113,8 @@ def upsert_invoice(body: InvoiceBody, authorization: Optional[str] = Header(None
     try:
         core.upsert_invoice(conn, body.invoice_number, quantity=body.quantity, model=body.model,
                              vehicle_number=body.vehicle_number, customer_name=body.customer_name,
-                             entry_date=body.entry_date, storage_location=body.storage_location)
+                             entry_date=body.entry_date, storage_location=body.storage_location,
+                             warehouse=body.warehouse)
     finally:
         conn.close()
     return {"ok": True}
@@ -140,6 +142,7 @@ class RecordBody(BaseModel):
     customer_name: str = ""
     entry_date: str = ""
     storage_location: str = ""
+    warehouse: str = ""
     sheet_name: str = "Manual Entry"
     source: str = "manual"
 
@@ -154,6 +157,7 @@ def add_record(body: RecordBody, authorization: Optional[str] = Header(None)):
             sheet_name=body.sheet_name, source=body.source, added_by=user["username"],
             vehicle_number=body.vehicle_number, customer_name=body.customer_name,
             entry_date=body.entry_date, storage_location=body.storage_location,
+            warehouse=body.warehouse,
         )
     finally:
         conn.close()
@@ -215,13 +219,17 @@ def get_duplicates(authorization: Optional[str] = Header(None)):
 
 class ResolveBody(BaseModel):
     action: str  # discard | replace | keep_both
+    admin_password: Optional[str] = None
 
 
 @app.post("/duplicates/{dup_id}/resolve")
 def resolve_duplicate(dup_id: int, body: ResolveBody, authorization: Optional[str] = Header(None)):
-    current_user(authorization)
+    user = current_user(authorization)
     conn = db_conn()
     try:
+        if user["role"] != "admin":
+            if not body.admin_password or not core.verify_any_admin_password(conn, body.admin_password):
+                raise HTTPException(status_code=403, detail="Admin authorization required to resolve a duplicate.")
         core.resolve_duplicate(conn, dup_id, body.action)
     finally:
         conn.close()
@@ -340,3 +348,78 @@ def set_user_active(username: str, body: ActiveBody, authorization: Optional[str
 @app.get("/")
 def health():
     return {"status": "ok", "app": "Serial Number Consolidator API"}
+
+
+# --- Model / Warehouse lookup lists ---
+
+@app.get("/models")
+def get_models(authorization: Optional[str] = Header(None)):
+    current_user(authorization)
+    conn = db_conn()
+    try:
+        rows = core.list_models(conn)
+    finally:
+        conn.close()
+    return {"rows": rows}
+
+
+class NameBody(BaseModel):
+    name: str
+
+
+@app.post("/models")
+def post_model(body: NameBody, authorization: Optional[str] = Header(None)):
+    user = current_user(authorization)
+    require_admin(user)
+    conn = db_conn()
+    try:
+        core.add_model(conn, body.name)
+    finally:
+        conn.close()
+    return {"ok": True}
+
+
+@app.get("/warehouses")
+def get_warehouses(authorization: Optional[str] = Header(None)):
+    current_user(authorization)
+    conn = db_conn()
+    try:
+        rows = core.list_warehouses(conn)
+    finally:
+        conn.close()
+    return {"rows": rows}
+
+
+@app.post("/warehouses")
+def post_warehouse(body: NameBody, authorization: Optional[str] = Header(None)):
+    user = current_user(authorization)
+    require_admin(user)
+    conn = db_conn()
+    try:
+        core.add_warehouse(conn, body.name)
+    finally:
+        conn.close()
+    return {"ok": True}
+
+
+@app.post("/lookup-lists/import")
+async def import_lookup_lists(file: UploadFile = File(...), authorization: Optional[str] = Header(None)):
+    user = current_user(authorization)
+    require_admin(user)
+    contents = await file.read()
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+            tmp.write(contents)
+            tmp_path = tmp.name
+        conn = db_conn()
+        try:
+            summary = core.import_lookup_lists(conn, tmp_path)
+        finally:
+            conn.close()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not process '{file.filename}': {e}")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+    return summary
